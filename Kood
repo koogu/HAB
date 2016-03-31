@@ -1,0 +1,441 @@
+#define RADIOPIN 9
+#define GPSENABLE 3
+#define RADIOEN 2
+//#include <string.h>
+#include <util/crc16.h>
+#include <util/delay.h>
+
+//SD KAARDI värk
+volatile int sdAddress =0;
+byte clr;     // dummy variable used to clear some of the SPI registers
+byte spi_err; // SPI timeout flag, must be cleared manually
+byte spi_cmd(volatile char data) {
+  spi_err = 0; // reset spi error
+  SPDR = data; // start the transmission by loading the output byte into the spi data register
+  int i = 0;
+  while (!(SPSR & (1<<SPIF))) {
+    i++;
+    if (i >= 0xFF) {
+      spi_err = 1;
+      return(0x00);
+    }
+  }
+  // returned value
+  return(SPDR);
+}
+
+// initialize SPI port
+void spi_initialize(void) {
+  SPCR = (1<<SPE) | (1<<MSTR); // spi enabled, master mode
+  clr = SPSR; // dummy read registers to clear previous results
+  clr = SPDR;
+}
+
+//********************* SD CARD SECTION BELOW *********************
+
+// SD Card variables      // block size (default 512 bytes)
+byte vBlock[512];        // set vector containing data that will be recorded on SD Card
+//byte vBuffer[16];
+
+
+// Send a SD command, num is the actual index, NOT OR'ed with 0x40.
+// arg is all four bytes of the argument
+byte sdc_cmd(byte commandIndex, long arg) {
+  PORTB &= ~(1<<PINB2);   // assert chip select for the card
+  spi_cmd(0xFF);           // dummy byte
+  commandIndex |= 0x40;    // command token OR'ed with 0x40
+  spi_cmd(commandIndex);   // send command
+  for (int i=3; i>=0; i--) {
+    spi_cmd(arg>>(i*8));   // send argument in little endian form (MSB first)
+  }
+  spi_cmd(0x95);           // checksum valid for 0x00, not needed thereafter, so we can hardcode this value
+  spi_cmd(0xFF);           // dummy byte gives card time to process
+  byte res = spi_cmd(0xFF);
+  return (res);  // query return value from card
+}
+byte sdc_initialize(void) {
+  // set slow clock: 1/128 base frequency (125Khz in this case)
+  SPCR |=  (1<<SPR1) | (1<<SPR0); // set slow clock: 1/128 base frequency (125Khz in this case)
+  SPSR &= ~(1<<SPI2X);            // No doubled clock frequency
+  // wake up SD card
+  PORTB |=  (1<<PINB2);          // deasserts card for warmup
+  PORTB |=  (1<<PINB3);        // set MOSI high
+  for(byte i=0; i<10; i++) {
+    spi_cmd(0xFF);                // send 10 times 8 pulses for a warmup (74 minimum)
+  }
+  // set idle mode
+  byte retries=0;
+  PORTB &= ~(1<<PINB2);          // assert chip select for the card
+  while(sdc_cmd(0x00, 0) != 0x01) { // while SD card is not in iddle state
+    retries++;
+    if (retries >= 0xFF) {
+      return(NULL); // timed out!
+    }
+    delay(5);
+  }
+  // at this stage, the card is in idle mode and ready for start up
+  retries = 0;
+  sdc_cmd(0x37, 0); // startup sequence for SD cards 55/41
+  while (sdc_cmd(0x29, 0) != 0x00) {
+    retries++;
+    if (retries >= 0xFF) {
+      return(NULL); // timed out!
+    }
+    sdc_cmd(0x37, 0);
+  }
+  // set fast clock, 1/4 CPU clock frequency (4Mhz in this case)
+  SPCR &= ~((1<<SPR1) | (1<<SPR0)); // Clock Frequency: f_OSC / 4
+  SPSR |=  (1<<SPI2X);              // Doubled Clock Frequency: f_OSC / 2
+  return (0x01); // returned value (success)
+}
+
+
+// write block on SD card
+// addr is the address in bytes (multiples of block size)
+void sdc_writeBlock(long blockIndex) {
+  byte retries=0;
+  while(sdc_cmd(0x18, blockIndex * 512) != 0x00) {
+    delay(1);
+    retries++;
+    if (retries >= 0xFF) return; // timed out!
+  }
+  spi_cmd(0xFF); // dummy byte (at least one)
+  // send data packet (includes data token, data block and CRC)
+  // data token
+  spi_cmd(0xFE);
+  // copy block data
+  for (int i=0; i<512; i++) {
+    spi_cmd(vBlock[i]);
+  }
+  // write CRC (lost results in blue sky)
+  spi_cmd(0xFF); // LSB
+  spi_cmd(0xFF); // MSB
+  // wait until write is finished
+  while (spi_cmd(0xFF) != 0xFF) delay(1); // kind of NOP
+}
+
+// SD KAARID VÄRK LÕPPEB
+
+
+
+
+#include <Wire.h> // rõhu jaoks
+const int presAadr=0x28;
+
+#include <OneWire.h> // temperatuur
+#include <DallasTemperature.h>
+#define OneWireBus 8
+OneWire oneWire(OneWireBus);
+DallasTemperature temp(&oneWire);
+
+DeviceAddress Temp1 = {0x28, 0x7D, 0xC8, 0xA1, 0x07, 0x00, 0x00, 0x8C};
+DeviceAddress Temp2 = {0x28, 0x45, 0xC2, 0xA0, 0x07, 0x00, 0x00, 0xF2};
+DeviceAddress Temp3 = {0x28, 0x36, 0xA6, 0xA1, 0x07, 0x00, 0x00, 0xB2};
+DeviceAddress Temp4 = {0x28, 0x62, 0xD0, 0x9F, 0x07, 0x00, 0x00, 0xEC};
+
+char datastring[180];
+char GPSBuffer[182];
+byte GPSIndex=0;
+int id=0;
+
+void setup()
+{
+
+  DDRB &= ~(1<<PINB4);
+  DDRB |=  (1<<PINB5);
+  DDRB |=  (1<<PINB2);
+  DDRB |=  (1<<PINB3);
+  //Serial.begin(115200);
+  spi_err=0;        // reset SPI error
+  spi_initialize(); // initialize SPI port
+  sdc_initialize(); // Initialize SD Card
+
+
+  Wire.begin(); //Alustab i2c rõhu jaoks
+
+  temp.begin(); //temperatuuri init
+  temp.setResolution(Temp1,12);
+  temp.setResolution(Temp2,12);
+  temp.setResolution(Temp3,12);
+  temp.setResolution(Temp4,12);
+
+  pinMode(RADIOEN, OUTPUT);
+  digitalWrite(RADIOEN, HIGH);
+  pinMode(GPSENABLE, OUTPUT); //gps pin kõrgeks
+  digitalWrite(GPSENABLE, HIGH); //gps pin kõrgeks
+  Serial.begin(9600);
+
+  setGPS_DynamicModel6();
+
+  //SD.begin(SDCS);
+
+  pinMode(RADIOPIN,OUTPUT);
+  //setPwmFrequency(RADIOPIN, 1);
+  setPwmFrequency(1);
+
+}
+
+void loop()
+{
+  CheckGPS();
+}
+
+void CheckGPS()
+{
+  char inByte;
+  while (Serial.available() > 0)
+  {
+    inByte = (char)Serial.read();
+
+    if ((inByte =='$') || (GPSIndex >= 180))
+    {
+      GPSIndex = 0;
+    }
+    if (inByte != '\r')
+    {
+      GPSBuffer[GPSIndex++] = inByte;
+    }
+    if (inByte == '\n')
+    {
+      GPSIndex = 0;
+      ProcessGPSLine();
+      memset(GPSBuffer, 0, sizeof(GPSBuffer));
+    }
+  }
+}
+
+char data_send[255];
+
+//tempRead();
+
+void ProcessGPSLine() //siin vaatab, et andmed oleks õiged ja saadab selle maale.
+{
+  if ((GPSBuffer[1] == 'G') && (GPSBuffer[2] == 'N') && (GPSBuffer[3] == 'G') && (GPSBuffer[4] == 'G') && (GPSBuffer[5] == 'A'))
+  {
+    int i;
+    char *(elms[15]);
+    elms[0] = GPSBuffer;
+    i = 1;
+    for (char *x = GPSBuffer; *x != 0; x++) {
+      if (*x == ',') {
+        elms[i] = x + 1;
+        *x = 0;
+        i++;
+      }
+    }
+
+    float pres = pressure();
+    float relhum = humidity();
+    float temp[4];
+    tempRead(temp);
+
+    int pos = snprintf(data_send, sizeof(data_send), "$$kookon,%d,%s,%s,%s,%s,%f,%f,%f,%f,%f,%f",
+      id,
+      strtok(elms[1],"."),
+      elms[2], //põhjalaius, saadab xx kraadi ja yy.yyy minutit
+      elms[4], //idapikkus, saadab xx kraadi ja yy.yyy minutit
+      elms[9], //kõrgus, õige number
+      pres,
+      relhum,
+      temp[0], temp[1], temp[2], temp[3]
+    );
+
+    id++;
+
+    unsigned int CHECKSUM = gps_CRC16_checksum(data_send); // Calculates the checksum for this datastring
+
+    pos += snprintf(data_send + pos, sizeof(data_send) - pos, "*%04X\r\n", CHECKSUM);
+
+    memcpy(vBlock, data_send, pos);
+    sdc_writeBlock(sdAddress);
+    sdAddress++;
+
+    rtty_txstring(data_send);
+/*
+    char subbuff1[51];
+    char subbuff2[131];
+    memcpy(subbuff1,&datastring[0],50);
+    subbuff1[50]='\0';
+    memcpy(subbuff2,&datastring[50],130);
+    rtty_txstring (subbuff1);
+    //saveSD();
+    rtty_txstring(subbuff2);
+    */
+  }
+}
+
+void rtty_txstring (char * string) { //alustab saatmisprotsessi
+    char c;
+    c = *string++;
+    while ( c != '\0') {
+        rtty_txbyte (c);
+        c = *string++;
+    }
+}
+void rtty_txbyte (char c) {
+    /* Simple function to sent each bit of a char to
+    ** rtty_txbit function.
+    ** NB The bits are sent Least Significant Bit first
+    ** All chars should be preceded with a 0 and
+    ** proceed with a 1. 0 = Start bit; 1 = Stop bit
+    */
+    int i;
+    rtty_txbit (0); // Start bit
+    // Send bits for for char LSB first
+    for (i=0;i<7;i++) { // Change this here 7 or 8 for ASCII-7 / ASCII-8
+        if (c & 1) rtty_txbit(1);
+        else rtty_txbit(0);
+        c = c >> 1;
+    }
+    rtty_txbit (1); // Stop bit
+    rtty_txbit (1); // Stop bit
+}
+//gEPSU TEGMINE dynamic model 6-de
+void setGPS_DynamicModel6() //Saaadab käsu UBLOX-i, et ma tahan nüüd olla dynamic model 6, ehk airborne <1g
+{
+ int gps_set_sucess=0;
+ uint8_t setdm6[] = {
+ 0xB5, 0x62, 0x06, 0x24, 0x24, 0x00, 0xFF, 0xFF, 0x06,
+ 0x03, 0x00, 0x00, 0x00, 0x00, 0x10, 0x27, 0x00, 0x00,
+ 0x05, 0x00, 0xFA, 0x00, 0xFA, 0x00, 0x64, 0x00, 0x2C,
+ 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x16, 0xDC};
+ while(!gps_set_sucess)
+ {
+ sendUBX(setdm6, sizeof(setdm6)/sizeof(uint8_t));
+ gps_set_sucess=getUBX_ACK(setdm6);
+ }
+}
+void sendUBX(uint8_t *MSG, uint8_t len) {
+ Serial.flush();
+ Serial.write(0xFF);
+ _delay_ms(500);
+ for(int i=0; i<len; i++) {
+ Serial.write(MSG[i]);
+ }
+}
+boolean getUBX_ACK(uint8_t *MSG) {
+ uint8_t b;
+ uint8_t ackByteID = 0;
+ uint8_t ackPacket[10];
+ unsigned long startTime = millis();
+
+// Construct the expected ACK packet
+ ackPacket[0] = 0xB5; // header
+ ackPacket[1] = 0x62; // header
+ ackPacket[2] = 0x05; // class
+ ackPacket[3] = 0x01; // id
+ ackPacket[4] = 0x02; // length
+ ackPacket[5] = 0x00;
+ ackPacket[6] = MSG[2]; // ACK class
+ ackPacket[7] = MSG[3]; // ACK id
+ ackPacket[8] = 0; // CK_A
+ ackPacket[9] = 0; // CK_B
+
+// Calculate the checksums
+ for (uint8_t ubxi=2; ubxi<8; ubxi++) {
+ ackPacket[8] = ackPacket[8] + ackPacket[ubxi];
+ ackPacket[9] = ackPacket[9] + ackPacket[8];
+ }
+while (1) {
+
+// Test for success
+ if (ackByteID > 9) {
+ // All packets in order!
+ return true;
+ }
+
+// Timeout if no valid response in 3 seconds
+ if (millis() - startTime > 3000) {
+ return false;
+ }
+
+// Make sure data is available to read
+ if (Serial.available()) {
+ b = Serial.read();
+
+// Check that bytes arrive in sequence as per expected ACK packet
+ if (b == ackPacket[ackByteID]) {
+ ackByteID++;
+ }
+ else {
+ ackByteID = 0; // Reset and look again, invalid order
+ }
+ }
+ }
+}
+void rtty_txbit (int bit) {
+    if (bit) {
+        // high
+        analogWrite(RADIOPIN,110);
+    }
+    else {
+        // low
+        analogWrite(RADIOPIN,100);
+    }
+    delayMicroseconds(5000);
+    delayMicroseconds(5150);
+}
+
+uint16_t gps_CRC16_checksum (char *string) {
+    size_t i;
+    uint16_t crc;
+    uint8_t c;
+    crc = 0xFFFF;
+
+    // Calculate checksum ignoring the first two $s
+    for (i = 2; i < strlen(string); i++) {
+        c = string[i];
+        crc = _crc_xmodem_update (crc, c);
+    }
+    return crc;
+}
+
+void setPwmFrequency(int divisor) {
+    byte mode;
+    switch(divisor) {
+        case 1:
+            mode = 0x01;
+            break;
+        case 8:
+            mode = 0x02;
+            break;
+        case 64:
+            mode = 0x03;
+            break;
+        case 256:
+            mode = 0x04;
+            break;
+        case 1024:
+            mode = 0x05;
+            break;
+        default:
+            return;
+        }
+    TCCR1B = TCCR1B & 0b11111000 | mode;
+}
+
+float pressure() {
+  Wire.requestFrom(presAadr,2); //tahab ainult rõhku
+  byte Hbit=Wire.read()&0b00111111;
+  byte Lbit=Wire.read();
+  int digPres = word(Hbit,Lbit);
+  float output=((float(digPres)-1638.0)/(14745.0-1638.0))*1034.21;
+ // Serial.println(output);
+  return output;
+}
+
+void tempRead(float res[4]){
+  temp.requestTemperatures();
+  res[0] = temp.getTempC(Temp1); //milline läheb välja, peab ära kalibreerima
+  res[1] = temp.getTempC(Temp2);
+  res[2] = temp.getTempC(Temp3);
+  res[3] = temp.getTempC(Temp4);
+  }
+
+float humidity(){
+  int rhVal = analogRead(A0);
+  float rhVoltage = (rhVal/1024.0)*5.0;
+  float sensorHumidity = ((rhVoltage/5.0)-0.16)/0.0062;
+  return sensorHumidity;
+}
