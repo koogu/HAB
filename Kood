@@ -1,9 +1,11 @@
 #define RADIOPIN 9
+
 #define GPSENABLE 3
 #define RADIOEN 2
 //#include <string.h>
 #include <util/crc16.h>
 #include <util/delay.h>
+#include <SoftwareSerial.h>
 
 //SD KAARDI värk
 volatile int sdAddress =0;
@@ -128,19 +130,56 @@ const int presAadr=0x28;
 OneWire oneWire(OneWireBus);
 DallasTemperature temp(&oneWire);
 
-DeviceAddress Temp1 = {0x28, 0x7D, 0xC8, 0xA1, 0x07, 0x00, 0x00, 0x8C};
-DeviceAddress Temp2 = {0x28, 0x45, 0xC2, 0xA0, 0x07, 0x00, 0x00, 0xF2};
-DeviceAddress Temp3 = {0x28, 0x36, 0xA6, 0xA1, 0x07, 0x00, 0x00, 0xB2};
-DeviceAddress Temp4 = {0x28, 0x62, 0xD0, 0x9F, 0x07, 0x00, 0x00, 0xEC};
+DeviceAddress Temp1 = {0x28, 0x7D, 0xC8, 0xA1, 0x07, 0x00, 0x00, 0x8C}; //üles
+DeviceAddress Temp2 = {0x28, 0x45, 0xC2, 0xA0, 0x07, 0x00, 0x00, 0xF2}; //parwmalw
+DeviceAddress Temp3 = {0x28, 0x36, 0xA6, 0xA1, 0x07, 0x00, 0x00, 0xB2}; //alla
+DeviceAddress Temp4 = {0x28, 0x62, 0xD0, 0x9F, 0x07, 0x00, 0x00, 0xEC};//vasakule
 
 char datastring[180];
 char GPSBuffer[182];
 byte GPSIndex=0;
 int id=0;
 
+
+//#define RADIOEN 2
+#define MTX2_FREQ 434.065
+#define RTTY_BAUD 100
+#define TXDELAY 0
+
+SoftwareSerial MTX2_EN(6,RADIOEN);
+
+void setMTX2Frequency()
+{
+  float _mtx2comp;
+  int _mtx2int;
+  long _mtx2fractional;
+  char _mtx2command[17];
+  MTX2_EN.begin(9600);
+  _mtx2comp=(MTX2_FREQ+0.0015)/6.5;
+  _mtx2int=_mtx2comp;
+  _mtx2fractional=float(((_mtx2comp-_mtx2int)+1)*524288);
+  snprintf(_mtx2command,17,"@PRG_%02X%06lX\r",_mtx2int-1, _mtx2fractional);
+  delay(100);
+  MTX2_EN.print(_mtx2command);
+  delay(50);
+  MTX2_EN.end();
+}  
+
+//et saata andmeid interrupti põhiselt
+#define ASCII 7
+#define STOPBITS 2
+
+volatile int txstatus=1;
+volatile int txstringlength=0;
+volatile char txc;
+volatile int txi;
+volatile int txj;
+unsigned int count=0;
+char txstring[180];
+
+
 void setup()
 {
-
   DDRB &= ~(1<<PINB4);
   DDRB |=  (1<<PINB5);
   DDRB |=  (1<<PINB2);
@@ -149,7 +188,6 @@ void setup()
   spi_err=0;        // reset SPI error
   spi_initialize(); // initialize SPI port
   sdc_initialize(); // Initialize SD Card
-
 
   Wire.begin(); //Alustab i2c rõhu jaoks
 
@@ -164,19 +202,21 @@ void setup()
   pinMode(GPSENABLE, OUTPUT); //gps pin kõrgeks
   digitalWrite(GPSENABLE, HIGH); //gps pin kõrgeks
   Serial.begin(9600);
-
+  initialise_interrupt();
+  setMTX2Frequency();
   setGPS_DynamicModel6();
 
   //SD.begin(SDCS);
 
   pinMode(RADIOPIN,OUTPUT);
   //setPwmFrequency(RADIOPIN, 1);
-  setPwmFrequency(1);
-
+  //setPwmFrequency(1);
+  TCCR1B = TCCR1B & 0b11111000 | 0x01; //set PWM freq
 }
 
 void loop()
 {
+
   CheckGPS();
 }
 
@@ -204,9 +244,7 @@ void CheckGPS()
   }
 }
 
-char data_send[255];
-
-//tempRead();
+ 
 
 void ProcessGPSLine() //siin vaatab, et andmed oleks õiged ja saadab selle maale.
 {
@@ -223,35 +261,45 @@ void ProcessGPSLine() //siin vaatab, et andmed oleks õiged ja saadab selle maal
         i++;
       }
     }
+    String data_send= "$$kookon,";
+    data_send+=String(id); //Id, mis teele läheb
+    data_send+=","; //komad komad komad
+    id+=1;    //mitmes lause
+    String mem=strtok(elms[1],"."); //see on aja osa, aga milleks on vaja strtok, mis lahutab ära ta .-ga?
+    data_send+=mem;
+    data_send+=",";
+    data_send+=elms[2]; //põhjalaius, saadab xx kraadi ja yy.yyy minutit
+    data_send+=",";
+    data_send+=elms[4]; //idapikkus, saadab xx kraadi ja yy.yyy minutit
+    data_send+=",";
+    data_send+=elms[9]; //kõrgus, õige number
+    data_send+=",";
+    String pressureData=pressure();
+    data_send+=pressureData;
+    data_send+=",";
+    String humidityData=humidity();
+    data_send+=humidityData;
+    data_send+=",";
+    String tempData=tempRead();
+    data_send+=tempData;
 
-    float pres = pressure();
-    float relhum = humidity();
-    float temp[4];
-    tempRead(temp);
 
-    int pos = snprintf(data_send, sizeof(data_send), "$$kookon,%d,%s,%s,%s,%s,%f,%f,%f,%f,%f,%f",
-      id,
-      strtok(elms[1],"."),
-      elms[2], //põhjalaius, saadab xx kraadi ja yy.yyy minutit
-      elms[4], //idapikkus, saadab xx kraadi ja yy.yyy minutit
-      elms[9], //kõrgus, õige number
-      pres,
-      relhum,
-      temp[0], temp[1], temp[2], temp[3]
-    );
+    int send_dataLen = data_send.length()+1;
+    char send_dataArray[send_dataLen];
+    data_send.toCharArray(send_dataArray, send_dataLen);
 
-    id++;
+    snprintf(datastring,180,send_dataArray); // Puts the text in the datastring
+    unsigned int CHECKSUM = gps_CRC16_checksum(datastring); // Calculates the checksum for this datastring
+    char checksum_str[10];
+    sprintf(checksum_str, "*%04X\r\n", CHECKSUM);
+    strcat(datastring,checksum_str);
 
-    unsigned int CHECKSUM = gps_CRC16_checksum(data_send); // Calculates the checksum for this datastring
-
-    pos += snprintf(data_send + pos, sizeof(data_send) - pos, "*%04X\r\n", CHECKSUM);
-
-    memcpy(vBlock, data_send, pos);
+    memcpy(vBlock,&data_send[0],data_send.length());
     sdc_writeBlock(sdAddress);
     sdAddress++;
 
-    rtty_txstring(data_send);
-/*
+/*    rtty_txstring(datastring);
+
     char subbuff1[51];
     char subbuff2[131];
     memcpy(subbuff1,&datastring[0],50);
@@ -263,7 +311,7 @@ void ProcessGPSLine() //siin vaatab, et andmed oleks õiged ja saadab selle maal
     */
   }
 }
-
+/*
 void rtty_txstring (char * string) { //alustab saatmisprotsessi
     char c;
     c = *string++;
@@ -278,7 +326,7 @@ void rtty_txbyte (char c) {
     ** NB The bits are sent Least Significant Bit first
     ** All chars should be preceded with a 0 and
     ** proceed with a 1. 0 = Start bit; 1 = Stop bit
-    */
+    
     int i;
     rtty_txbit (0); // Start bit
     // Send bits for for char LSB first
@@ -290,6 +338,8 @@ void rtty_txbyte (char c) {
     rtty_txbit (1); // Stop bit
     rtty_txbit (1); // Stop bit
 }
+
+*/
 //gEPSU TEGMINE dynamic model 6-de
 void setGPS_DynamicModel6() //Saaadab käsu UBLOX-i, et ma tahan nüüd olla dynamic model 6, ehk airborne <1g
 {
@@ -373,8 +423,8 @@ void rtty_txbit (int bit) {
         // low
         analogWrite(RADIOPIN,100);
     }
-    delayMicroseconds(5000);
-    delayMicroseconds(5150);
+   // delayMicroseconds(5000);
+   // delayMicroseconds(5150);
 }
 
 uint16_t gps_CRC16_checksum (char *string) {
@@ -390,7 +440,7 @@ uint16_t gps_CRC16_checksum (char *string) {
     }
     return crc;
 }
-
+/*
 void setPwmFrequency(int divisor) {
     byte mode;
     switch(divisor) {
@@ -412,30 +462,96 @@ void setPwmFrequency(int divisor) {
         default:
             return;
         }
-    TCCR1B = TCCR1B & 0b11111000 | mode;
+    TCCR1B = TCCR1B & 0b11111000 | 0x01;
+}
+*/
+void initialise_interrupt() 
+{
+  // initialize Timer1
+  cli();          // disable global interrupts
+  TCCR2A = 0;     // set entire TCCR1A register to 0
+  TCCR2B = 0;     // same for TCCR1B
+  OCR2A = F_CPU / 1024 / RTTY_BAUD - 1;  // set compare match register to desired timer count:
+  TCCR2A |= (1 << WGM21);   // turn on CTC mode:
+  // Set CS10 and CS12 bits for:
+  TCCR2B |= (1 << CS20);
+  TCCR2B |= (1 << CS21);
+  TCCR2B |= (1 << CS22);
+  // enable timer compare interrupt:
+  TIMSK2 |= (1 << OCIE2A);
+  sei();          // enable global interrupts
 }
 
-float pressure() {
+ISR(TIMER2_COMPA_vect)
+{
+  switch(txstatus) {
+  case 1: // Initialise transmission, take a copy of the string so it doesn't change mid transmission. 
+    strcpy(txstring,datastring);
+    txstringlength=strlen(txstring);
+    txstatus=2;
+    txj=0;
+    break;
+  case 2: // Grab a char and lets go transmit it. 
+    if ( txj < txstringlength)
+    {
+      txc = txstring[txj];
+      txj++;
+      txstatus=3;
+      rtty_txbit (0); // Start Bit;
+      txi=0;
+    }
+    else
+    {
+      txstatus=0; // Should be finished
+      txj=0;
+    }
+    break;
+  case 3:
+    if(txi<ASCII)
+    {
+      txi++;
+      if (txc & 1) rtty_txbit(1); 
+      else rtty_txbit(0);   
+      txc = txc >> 1;
+      break;
+    }
+    else
+    {
+      rtty_txbit (1); // Stop Bit
+      txstatus=4;
+      txi=0;
+      break;
+    } 
+  case 4:
+    rtty_txbit (1); // Stop Bit
+    txstatus=2;
+    break;
+    
+  }
+}
+
+String pressure() {
   Wire.requestFrom(presAadr,2); //tahab ainult rõhku
   byte Hbit=Wire.read()&0b00111111;
   byte Lbit=Wire.read();
   int digPres = word(Hbit,Lbit);
   float output=((float(digPres)-1638.0)/(14745.0-1638.0))*1034.21;
  // Serial.println(output);
-  return output;
+  return String(output);
 }
 
-void tempRead(float res[4]){
+String tempRead(){
   temp.requestTemperatures();
-  res[0] = temp.getTempC(Temp1); //milline läheb välja, peab ära kalibreerima
-  res[1] = temp.getTempC(Temp2);
-  res[2] = temp.getTempC(Temp3);
-  res[3] = temp.getTempC(Temp4);
+  float tempA = temp.getTempC(Temp1); //milline läheb välja, peab ära kalibreerima
+  float tempB = temp.getTempC(Temp2);
+  float tempC = temp.getTempC(Temp3);
+  float tempD = temp.getTempC(Temp4);
+  return String(tempA)+','+String(tempB)+','+String(tempC)+','+String(tempD)+"";
   }
 
-float humidity(){
+String humidity(){
   int rhVal = analogRead(A0);
   float rhVoltage = (rhVal/1024.0)*5.0;
   float sensorHumidity = ((rhVoltage/5.0)-0.16)/0.0062;
-  return sensorHumidity;
-}
+  return String(sensorHumidity);
+  }
