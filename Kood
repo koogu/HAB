@@ -5,7 +5,7 @@
 //#include <string.h>
 #include <util/crc16.h>
 #include <util/delay.h>
-#include <SoftwareSerial.h>
+//#include <SoftwareSerial.h>
 
 //SD KAARDI värk
 volatile int sdAddress =0;
@@ -135,19 +135,19 @@ DeviceAddress Temp2 = {0x28, 0x45, 0xC2, 0xA0, 0x07, 0x00, 0x00, 0xF2}; //parwma
 DeviceAddress Temp3 = {0x28, 0x36, 0xA6, 0xA1, 0x07, 0x00, 0x00, 0xB2}; //alla
 DeviceAddress Temp4 = {0x28, 0x62, 0xD0, 0x9F, 0x07, 0x00, 0x00, 0xEC};//vasakule
 
-char datastring[180];
+char datastring[160];
 char GPSBuffer[182];
 byte GPSIndex=0;
 int id=0;
 
 
 //#define RADIOEN 2
-#define MTX2_FREQ 434.065
+//#define MTX2_FREQ 434.065
 #define RTTY_BAUD 100
 #define TXDELAY 0
 
-SoftwareSerial MTX2_EN(6,RADIOEN);
-
+//SoftwareSerial MTX2_EN(6,RADIOEN);
+/*
 void setMTX2Frequency()
 {
   float _mtx2comp;
@@ -161,9 +161,13 @@ void setMTX2Frequency()
   snprintf(_mtx2command,17,"@PRG_%02X%06lX\r",_mtx2int-1, _mtx2fractional);
   delay(100);
   MTX2_EN.print(_mtx2command);
-  delay(50);
+  delay(100);
+  MTX2_EN.print("@PRG_BURN_CH0\r");
+  delay(100);
+  
   MTX2_EN.end();
 }  
+*/
 
 //et saata andmeid interrupti põhiselt
 #define ASCII 7
@@ -175,7 +179,7 @@ volatile char txc;
 volatile int txi;
 volatile int txj;
 unsigned int count=0;
-char txstring[180];
+char txstring[150];
 
 
 void setup()
@@ -203,10 +207,8 @@ void setup()
   digitalWrite(GPSENABLE, HIGH); //gps pin kõrgeks
   Serial.begin(9600);
   initialise_interrupt();
-  setMTX2Frequency();
+ // setMTX2Frequency();
   setGPS_DynamicModel6();
-
-  //SD.begin(SDCS);
 
   pinMode(RADIOPIN,OUTPUT);
   //setPwmFrequency(RADIOPIN, 1);
@@ -261,42 +263,67 @@ void ProcessGPSLine() //siin vaatab, et andmed oleks õiged ja saadab selle maal
         i++;
       }
     }
-    String data_send= "$$kookon,";
-    data_send+=String(id); //Id, mis teele läheb
-    data_send+=","; //komad komad komad
+    /*
+    String datastring= "$$IL2,";
+    datastring+=String(id); //Id, mis teele läheb
+    datastring+=","; //komad komad komad
     id+=1;    //mitmes lause
     String mem=strtok(elms[1],"."); //see on aja osa, aga milleks on vaja strtok, mis lahutab ära ta .-ga?
-    data_send+=mem;
-    data_send+=",";
-    data_send+=elms[2]; //põhjalaius, saadab xx kraadi ja yy.yyy minutit
-    data_send+=",";
-    data_send+=elms[4]; //idapikkus, saadab xx kraadi ja yy.yyy minutit
-    data_send+=",";
-    data_send+=elms[9]; //kõrgus, õige number
-    data_send+=",";
+    datastring+=mem;
+    datastring+=",";
+    datastring+=elms[2]; //põhjalaius, saadab xx kraadi ja yy.yyy minutit
+    datastring+=",";
+    datastring+=elms[4]; //idapikkus, saadab xx kraadi ja yy.yyy minutit
+    datastring+=",";
+    datastring+=elms[9]; //kõrgus, õige number
+    datastring+=",";
     String pressureData=pressure();
-    data_send+=pressureData;
-    data_send+=",";
+    datastring+=pressureData;
+    datastring+=",";
     String humidityData=humidity();
-    data_send+=humidityData;
-    data_send+=",";
+    datastring+=humidityData;
+    datastring+=",";
     String tempData=tempRead();
-    data_send+=tempData;
+    datastring+=tempData;
 
 
-    int send_dataLen = data_send.length()+1;
+    int send_dataLen = datastring.length()+1;
     char send_dataArray[send_dataLen];
-    data_send.toCharArray(send_dataArray, send_dataLen);
+    datastring.toCharArray(send_dataArray, send_dataLen);
 
-    snprintf(datastring,180,send_dataArray); // Puts the text in the datastring
+    snprintf(datastring,160,send_dataArray); // Puts the text in the datastring
     unsigned int CHECKSUM = gps_CRC16_checksum(datastring); // Calculates the checksum for this datastring
     char checksum_str[10];
     sprintf(checksum_str, "*%04X\r\n", CHECKSUM);
     strcat(datastring,checksum_str);
+*/
 
-    memcpy(vBlock,&data_send[0],data_send.length());
+    float pres = pressure();
+    float relhum = humidity();
+    float temp[4];
+    tempRead(temp);
+
+    int pos = snprintf(datastring, sizeof(datastring), "$$IP2,%d,%s,%s,%s,%s,%f,%f,%f,%f,%f,%f",
+      id,
+      strtok(elms[1],"."),
+      elms[2], //põhjalaius, saadab xx kraadi ja yy.yyy minutit
+      elms[4], //idapikkus, saadab xx kraadi ja yy.yyy minutit
+      elms[9], //kõrgus, õige number
+      pres,
+      relhum,
+      temp[0], temp[1], temp[2], temp[3]
+    );
+
+    id++;
+
+    unsigned int CHECKSUM = gps_CRC16_checksum(datastring); // Calculates the checksum for this datastring
+
+    pos += snprintf(datastring + pos, sizeof(datastring) - pos, "*%04X\r\n", CHECKSUM);
+    
+    memcpy(vBlock, datastring, pos);
     sdc_writeBlock(sdAddress);
     sdAddress++;
+
 
 /*    rtty_txstring(datastring);
 
@@ -485,6 +512,13 @@ void initialise_interrupt()
 ISR(TIMER2_COMPA_vect)
 {
   switch(txstatus) {
+  case 0: // This is the optional delay between transmissions.
+    txj++;
+    if(txj>(TXDELAY*RTTY_BAUD)) { 
+      txj=0;
+      txstatus=1;
+    }
+    break;
   case 1: // Initialise transmission, take a copy of the string so it doesn't change mid transmission. 
     strcpy(txstring,datastring);
     txstringlength=strlen(txstring);
@@ -526,32 +560,32 @@ ISR(TIMER2_COMPA_vect)
     rtty_txbit (1); // Stop Bit
     txstatus=2;
     break;
-    
+ 
   }
 }
+ 
 
-String pressure() {
+float pressure() {
   Wire.requestFrom(presAadr,2); //tahab ainult rõhku
   byte Hbit=Wire.read()&0b00111111;
   byte Lbit=Wire.read();
   int digPres = word(Hbit,Lbit);
   float output=((float(digPres)-1638.0)/(14745.0-1638.0))*1034.21;
  // Serial.println(output);
-  return String(output);
+  return output;
 }
 
-String tempRead(){
+void tempRead(float res[4]){
   temp.requestTemperatures();
-  float tempA = temp.getTempC(Temp1); //milline läheb välja, peab ära kalibreerima
-  float tempB = temp.getTempC(Temp2);
-  float tempC = temp.getTempC(Temp3);
-  float tempD = temp.getTempC(Temp4);
-  return String(tempA)+','+String(tempB)+','+String(tempC)+','+String(tempD)+"";
+  res[0] = temp.getTempC(Temp1); //milline läheb välja, peab ära kalibreerima
+  res[1] = temp.getTempC(Temp2);
+  res[2] = temp.getTempC(Temp3);
+  res[3] = temp.getTempC(Temp4);
   }
 
-String humidity(){
+float humidity(){
   int rhVal = analogRead(A0);
   float rhVoltage = (rhVal/1024.0)*5.0;
   float sensorHumidity = ((rhVoltage/5.0)-0.16)/0.0062;
-  return String(sensorHumidity);
-  }
+  return sensorHumidity;
+}
